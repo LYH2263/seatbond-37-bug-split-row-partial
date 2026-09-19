@@ -1,4 +1,4 @@
-from datetime import datetime
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -136,8 +136,6 @@ def seatmap(showtime_id: int, db: Session = Depends(get_db)):
     holds = db.scalars(select(SeatHold).where(SeatHold.showtime_id == showtime_id)).all()
     occupied: set[tuple[int, int]] = set()
     for h in holds:
-        if getattr(h, "segment_no", 1) != 1:
-            continue
         for c in range(h.start_col, h.end_col + 1):
             occupied.add((h.row, c))
     cells: list[SeatMapCell] = []
@@ -197,10 +195,10 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         raise HTTPException(409, "厅图已冻结，禁止锁座")
 
     existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
+    # 同单号的每一段都占用座位，后续锁座必须把全部段计入占用。
     holds = [
         HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col)
         for h in existing
-        if getattr(h, "segment_no", 1) == 1
     ]
     seats_by_row = _seats_by_row(hall)
 
@@ -214,39 +212,24 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         block = find_bond_across_rows(seats_by_row, holds, body.party_size)
     if block is not None:
         segments = [block]
-    elif body.party_size >= 1:
-        split = find_split_bond(seats_by_row, holds, body.party_size)
-        if split is None:
-            _log_conflict(
-                db, body.showtime_id, body.party_size, f"拆排后仍无足够空座（人数 {body.party_size}）"
-            )
-            stub = None
-            for row, cells in sorted(seats_by_row.items()):
-                stub = find_contiguous_block(cells, holds, row, 1)
-                if stub is not None:
-                    break
-            if stub is not None:
-                db.add(
-                    SeatHold(
-                        showtime_id=body.showtime_id,
-                        order_code=f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}",
-                        segment_no=1,
-                        row=stub.row,
-                        start_col=stub.start_col,
-                        end_col=stub.end_col,
-                        party_size=body.party_size,
-                    )
-                )
-                db.commit()
-            raise HTTPException(409, "拆排后仍无足够空座")
-        segments = split
-    else:
+    elif not body.allow_split:
+        # 拆排关闭：单排连座不够即整单失败，只记冲突，不写任何持座。
         _log_conflict(
             db, body.showtime_id, body.party_size, f"无足够连续空座（人数 {body.party_size}）"
         )
         raise HTTPException(409, "无足够连续空座")
+    else:
+        split = find_split_bond(seats_by_row, holds, body.party_size)
+        if split is None:
+            # 拆排开启仍放不下：整单失败，只记冲突，不留半截段。
+            _log_conflict(
+                db, body.showtime_id, body.party_size, f"拆排后仍无足够空座（人数 {body.party_size}）"
+            )
+            raise HTTPException(409, "拆排后仍无足够空座")
+        segments = split
 
-    # 整单校验：任一段撞上既有持座（遮挡/禁坐已在选段时排除）→ 全部不写，整单失败。
+    # 整单校验：候选段基于全部既有持座选出，理论上不会重叠；
+    # 命中只记冲突并整单失败，绝不写入任何一段。
     for seg in segments:
         hits = conflicts_with(holds, seg)
         if hits:
@@ -256,21 +239,9 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
                 body.party_size,
                 f"与既有持座重叠：第{hits[0].row}排 {hits[0].start_col}-{hits[0].end_col}",
             )
-            db.add(
-                SeatHold(
-                    showtime_id=body.showtime_id,
-                    order_code=f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}",
-                    segment_no=1,
-                    row=seg.row,
-                    start_col=seg.start_col,
-                    end_col=seg.end_col,
-                    party_size=body.party_size,
-                )
-            )
-            db.commit()
             raise HTTPException(409, "与既有持座冲突")
 
-    code = f"SB-{int(datetime.utcnow().timestamp()) % 100000:05d}"
+    code = f"SB-{uuid.uuid4().hex[:8].upper()}"
     order_holds = [
         SeatHold(
             showtime_id=body.showtime_id,

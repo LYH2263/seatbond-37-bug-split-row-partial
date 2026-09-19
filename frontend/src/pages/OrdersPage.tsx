@@ -36,7 +36,7 @@ export default function OrdersPage() {
               <td className="mono">{o.order_code}</td>
               <td>{o.showtime_id}</td>
               <td className="mono">
-                {o.segments.slice(0, 1).map((s) => (
+                {o.segments.map((s) => (
                   <div key={s.segment_no}>
                     段{s.segment_no} · R{s.row} C{s.start_col}-{s.end_col}
                   </div>

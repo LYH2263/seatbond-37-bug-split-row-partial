@@ -136,6 +136,62 @@ def test_split_fails_when_blocked_seats_reduce_total_no_residue(client, db):
     assert len(_conflicts_of(db, st.id)) == 1
 
 
+def test_split_disabled_does_not_split_even_with_switch_true_omitted(client, db):
+    # 关拆排且不勾开关：单排最长 3，要 4 人 → 整单失败、不占座
+    _, st = _mk_showtime(db)  # 过道第3列 → 单排最长连续 3
+    resp = client.post("/api/holds", json={"showtime_id": st.id, "party_size": 4, "allow_split": False})
+    assert resp.status_code == 409
+    assert _holds_of(db, st.id) == []
+
+
+def test_later_hold_cannot_overlap_any_segment_of_split_order(client, db):
+    # 2 排 × 7 列，过道第4列 → 每排 run(1-3)、run(5-7) 各 3 座。
+    # 4 人拆排：(1排1-3) + (1排5)。旧逻辑只认 segment_no==1，
+    # 再锁 3 人会压到 (1排5-7) 与第二段重叠；修复后必须落到 (2排1-3)。
+    _, st = _mk_showtime(db, rows=2, cols=7, aisle_cols="4")
+    first = client.post(
+        "/api/holds", json={"showtime_id": st.id, "party_size": 4, "allow_split": True}
+    )
+    assert first.status_code == 200
+    segs = first.json()["segments"]
+    assert [(s["row"], s["start_col"], s["end_col"]) for s in segs] == [
+        (1, 1, 3),
+        (1, 5, 5),
+    ]
+
+    second = client.post("/api/holds", json={"showtime_id": st.id, "party_size": 3})
+    assert second.status_code == 200
+    new_segs = second.json()["segments"]
+    assert [(s["row"], s["start_col"], s["end_col"]) for s in new_segs] == [(2, 1, 3)]
+    for ns in new_segs:
+        for s in segs:
+            if s["row"] != ns["row"]:
+                continue
+            assert ns["end_col"] < s["start_col"] or ns["start_col"] > s["end_col"]
+
+    # 座位图点亮两段 + 新单的全部座位
+    cells = client.get(f"/api/seatmap/{st.id}").json()["cells"]
+    lit = {(c["row"], c["col"]) for c in cells if c["occupied"]}
+    expect = set()
+    for s in segs + new_segs:
+        expect |= {(s["row"], c) for c in range(s["start_col"], s["end_col"] + 1)}
+    assert lit == expect
+    assert len(lit) == 7  # 4 + 3，无重复压座
+
+
+def test_split_segment_never_spans_aisle_or_blocked(client, db):
+    # 过道第3列：任何成功段都不得包含第3列，且总人数与各段长度一致
+    _, st = _mk_showtime(db, rows=2, cols=6, aisle_cols="3")
+    resp = client.post(
+        "/api/holds", json={"showtime_id": st.id, "party_size": 6, "allow_split": True}
+    )
+    assert resp.status_code == 200
+    segs = resp.json()["segments"]
+    assert sum(s["end_col"] - s["start_col"] + 1 for s in segs) == 6
+    for s in segs:
+        assert not (s["start_col"] <= 3 <= s["end_col"])
+
+
 def test_frozen_hall_rejects_even_when_seats_free(client, db):
     _, st = _mk_showtime(db, rows=2, cols=6, aisle_cols="", frozen=True)
     resp = client.post(
