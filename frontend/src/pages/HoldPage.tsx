@@ -40,7 +40,7 @@ export default function HoldPage() {
       const body: Record<string, unknown> = {
         showtime_id: sid,
         party_size: party,
-        allow_split: True,
+        allow_split: allowSplit,
       };
       if (prefRow) body.preferred_row = Number(prefRow);
       const order = await api<Order>("/holds", { method: "POST", body: JSON.stringify(body) });

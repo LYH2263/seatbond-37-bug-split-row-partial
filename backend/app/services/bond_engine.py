@@ -117,22 +117,33 @@ def find_split_bond(
     holds: list[HoldSpan],
     party_size: int,
 ) -> list[HoldSpan] | None:
-    """Split a party across rows into as few segments as possible."""
+    """Split a party across rows into as few segments as possible.
+
+    Every segment is taken from one free contiguous run (see free_segments):
+    never crossing aisles, blocked cells, or existing holds. Fewest segments
+    first — longest free runs first, ties broken by row then column; a
+    partially used run contributes its leftmost seats. Returns None when the
+    total free seats fall short of party_size.
+    """
     if party_size <= 0:
         return None
+    runs: list[tuple[int, int, int]] = []  # (row, start_col, end_col)
+    for row in sorted(seats_by_row.keys()):
+        for start, end in free_segments(seats_by_row[row], holds, row):
+            runs.append((row, start, end))
+    if sum(end - start + 1 for _, start, end in runs) < party_size:
+        return None
+    # 段数最少 → 最长空段优先；同长按排号、列号取
+    runs.sort(key=lambda r: (-(r[2] - r[1] + 1), r[0], r[1]))
     segments: list[HoldSpan] = []
     remaining = party_size
-    for row in sorted(seats_by_row.keys()):
+    for row, start, end in runs:
         if remaining <= 0:
             break
-        cols = sorted(c.col for c in seats_by_row[row])
-        if not cols:
-            continue
-        take = min(remaining, len(cols))
-        segments.append(HoldSpan(row=row, start_col=cols[0], end_col=cols[take - 1]))
+        take = min(remaining, end - start + 1)
+        segments.append(HoldSpan(row=row, start_col=start, end_col=start + take - 1))
         remaining -= take
-    if remaining > 0:
-        return None
+    segments.sort(key=lambda s: (s.row, s.start_col))
     return segments
 
 
